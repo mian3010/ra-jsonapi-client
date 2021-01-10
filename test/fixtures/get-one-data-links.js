@@ -5,5 +5,11 @@ export default {
     attributes: {
       name: 'Bob',
     },
+    links: {
+      self: '/user/1',
+    },
+  },
+  links: {
+    related: '/user/1',
   },
 };

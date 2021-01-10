@@ -1,19 +1,48 @@
 import { stringify } from 'qs';
 import merge from 'deepmerge';
 import axios from 'axios';
-import {
-  GET_LIST,
-  GET_ONE,
-  CREATE,
-  UPDATE,
-  DELETE,
-  GET_MANY,
-  GET_MANY_REFERENCE,
-} from './actions';
+import { Deserializer, Serializer } from 'jsonapi-serializer';
 
+import {
+  CREATE, DELETE, GET_LIST, GET_MANY, GET_MANY_REFERENCE, GET_ONE, UPDATE,
+} from './actions';
 import defaultSettings from './default-settings';
 import { NotImplementedError } from './errors';
 import init from './initializer';
+
+/** This proxy ensures that every relationship is serialized to an object of the form {id: x}, even
+ * if that relationship doesn't have included data
+ */
+const specialOpts = ['transform', 'keyForAttribute', 'id', 'typeAsAttribute', 'links'];
+const relationshipProxyHandler = {
+  has(target, key) {
+    // Pretend to have all keys except certain ones with special meanings
+    if (specialOpts.includes(key)) {
+      return key in target;
+    }
+    return true;
+  },
+  get(target, key) {
+    const fallback = target[key];
+
+    // Use the fallback for special options
+    if (specialOpts.includes(key)) {
+      return fallback;
+    }
+
+    // Merge the fallback with this object for per-resource settings
+    return Object.assign({
+      valueForRelationship(data, included) {
+        // If we have actual included data use it, but otherwise just return the id in an object
+        if (included) {
+          return included;
+        }
+
+        return { id: data.id };
+      },
+    }, fallback || {});
+  },
+};
 
 // Set HTTP interceptors.
 init();
@@ -36,6 +65,19 @@ export default (apiUrl, userSettings = {}) => (type, resource, params) => {
   const options = {
     headers: settings.headers,
   };
+
+  function getSerializerOpts() {
+    const resourceSpecific = settings.serializerOpts[resource] || {};
+
+    // By default, assume the user wants to serialize all keys except links, in case that's
+    // a leftover from a deserialized resource
+    const attributes = new Set(Object.keys(params.data));
+    attributes.delete('links');
+
+    return Object.assign({
+      attributes: [...attributes],
+    }, resourceSpecific);
+  }
 
   switch (type) {
     case GET_LIST: {
@@ -69,27 +111,16 @@ export default (apiUrl, userSettings = {}) => (type, resource, params) => {
     case CREATE:
       url = `${apiUrl}/${resource}`;
       options.method = 'POST';
-      options.data = JSON.stringify({
-        data: { type: resource, attributes: params.data },
-      });
+      options.data = new Serializer(resource, getSerializerOpts()).serialize(params.data);
       break;
 
     case UPDATE: {
       url = `${apiUrl}/${resource}/${params.id}`;
 
-      const attributes = params.data;
-      delete attributes.id;
-
-      const data = {
-        data: {
-          id: params.id,
-          type: resource,
-          attributes,
-        },
-      };
+      const data = Object.assign({ id: params.id }, params.data);
 
       options.method = settings.updateMethod;
-      options.data = JSON.stringify(data);
+      options.data = new Serializer(resource, getSerializerOpts()).serialize(data);
       break;
     }
 
@@ -134,76 +165,35 @@ export default (apiUrl, userSettings = {}) => (type, resource, params) => {
 
   return axios({ url, ...options })
     .then((response) => {
-      let total;
-
-      // For all collection requests get the total count.
-      if ([GET_LIST, GET_MANY, GET_MANY_REFERENCE].includes(type)) {
-        // When meta data and the 'total' setting is provided try
-        // to get the total count.
-        if (response.data.meta && settings.total) {
-          total = response.data.meta[settings.total];
-        }
-
-        // Use the length of the data array as a fallback.
-        total = total || response.data.data.length;
-      }
+      const opts = new Proxy(settings.deserializerOpts[resource] || {}, relationshipProxyHandler);
 
       switch (type) {
         case GET_MANY:
+        case GET_MANY_REFERENCE:
         case GET_LIST: {
-          return {
-            data: response.data.data.map(value => Object.assign(
-              { id: value.id },
-              value.attributes,
-            )),
-            total,
-          };
+          // Use the length of the data array as a fallback.
+          let total = response.data.data.length;
+          if (response.data.meta && settings.total) {
+            total = response.data.meta[settings.total];
+          }
+
+          return new Deserializer(opts).deserialize(response.data).then(
+            data => ({ data, total }),
+          );
         }
-
-        case GET_MANY_REFERENCE: {
-          return {
-            data: response.data.data.map(value => Object.assign(
-              { id: value.id },
-              value.attributes,
-            )),
-            total,
-          };
-        }
-
-        case GET_ONE: {
-          const { id, attributes } = response.data.data;
-
-          return {
-            data: {
-              id, ...attributes,
-            },
-          };
-        }
-
-        case CREATE: {
-          const { id, attributes } = response.data.data;
-
-          return {
-            data: {
-              id, ...attributes,
-            },
-          };
-        }
-
+        case GET_ONE:
+        case CREATE:
         case UPDATE: {
-          const { id, attributes } = response.data.data;
-
-          return {
-            data: {
-              id, ...attributes,
-            },
-          };
+          return new Deserializer(opts).deserialize(response.data).then(
+            data => ({ data }),
+          );
         }
-
         case DELETE: {
-          return {
-            data: { id: params.id },
-          };
+          return Promise.resolve({
+            data: {
+              id: params.id,
+            },
+          });
         }
 
         default:
